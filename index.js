@@ -36,7 +36,7 @@ const formatTime = (sec) => {
   return `${date},${ms}`;
 };
 
-// Upload endpoint
+// Upload endpoint - returns video directly
 app.post("/upload", upload.single("video"), async (req, res) => {
   try {
     const videoPath = req.file?.path;
@@ -69,9 +69,7 @@ app.post("/upload", upload.single("video"), async (req, res) => {
     const srtContent = words
       .map((word, i) => {
         const endTime = startTime + wordDuration;
-        const srtBlock = `${i + 1}
-${formatTime(startTime)} --> ${formatTime(endTime)}
-${word}\n`;
+        const srtBlock = `${i + 1}\n${formatTime(startTime)} --> ${formatTime(endTime)}\n${word}\n`;
         startTime = endTime;
         return srtBlock;
       })
@@ -82,8 +80,12 @@ ${word}\n`;
     const outputFilename = `final_${uuidv4().slice(0, 8)}.mp4`;
     const outputPath = path.join("output", outputFilename);
 
-    // Merge with FFmpeg
-    ffmpeg()
+    // Set response headers for video download
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${outputFilename}"`);
+
+    // Merge with FFmpeg and stream directly to response
+    const ffmpegProcess = ffmpeg()
       .input(videoPath)
       .input(audioPath)
       .videoFilters(`subtitles=${srtPath.replace(/\\/g, "/")}`)
@@ -92,29 +94,42 @@ ${word}\n`;
       .outputOption("-c:v", "libx264")
       .outputOption("-c:a", "aac")
       .outputOption("-shortest")
+      .format('mp4')
       .on("start", (cmd) => console.log("🎬 FFmpeg started:", cmd))
       .on("end", () => {
-        console.log("✅ Done: Video created at", outputPath);
-        res.json({ message: "Video created", file: outputFilename });
-
+        console.log("✅ Done: Video streamed successfully");
+        
         // Cleanup temp files
         try {
           fs.unlinkSync(videoPath);
           fs.unlinkSync(audioPath);
           fs.unlinkSync(srtPath);
+          // Don't delete output file immediately, clean up later or keep for caching
         } catch (err) {
           console.warn("⚠️ Cleanup error:", err.message);
         }
       })
       .on("error", (err) => {
         console.error("❌ FFmpeg error:", err.message);
-        return res.status(500).json({ error: "Failed to create video" });
-      })
-      .save(outputPath);
+        if (!res.headersSent) {
+          return res.status(500).json({ error: "Failed to create video" });
+        }
+      });
+
+    // Stream directly to response
+    ffmpegProcess.pipe(res, { end: true });
+
   } catch (err) {
     console.error("❌ Server Error:", err);
-    return res.status(500).json({ error: "Server failed" });
+    if (!res.headersSent) {
+      return res.status(500).json({ error: "Server failed" });
+    }
   }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
 app.listen(port, () => {
