@@ -80,12 +80,8 @@ app.post("/upload", upload.single("video"), async (req, res) => {
     const outputFilename = `final_${uuidv4().slice(0, 8)}.mp4`;
     const outputPath = path.join("output", outputFilename);
 
-    // Set response headers for video download
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${outputFilename}"`);
-
-    // Merge with FFmpeg and stream directly to response
-    const ffmpegProcess = ffmpeg()
+    // Merge with FFmpeg to file first, then stream
+    ffmpeg()
       .input(videoPath)
       .input(audioPath)
       .videoFilters(`subtitles=${srtPath.replace(/\\/g, "/")}`)
@@ -94,30 +90,43 @@ app.post("/upload", upload.single("video"), async (req, res) => {
       .outputOption("-c:v", "libx264")
       .outputOption("-c:a", "aac")
       .outputOption("-shortest")
-      .format('mp4')
       .on("start", (cmd) => console.log("🎬 FFmpeg started:", cmd))
       .on("end", () => {
-        console.log("✅ Done: Video streamed successfully");
+        console.log("✅ Done: Video created at", outputPath);
         
-        // Cleanup temp files
-        try {
-          fs.unlinkSync(videoPath);
-          fs.unlinkSync(audioPath);
-          fs.unlinkSync(srtPath);
-          // Don't delete output file immediately, clean up later or keep for caching
-        } catch (err) {
-          console.warn("⚠️ Cleanup error:", err.message);
-        }
+        // Stream the file to response
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${outputFilename}"`);
+        
+        const fileStream = fs.createReadStream(outputPath);
+        fileStream.pipe(res);
+        
+        fileStream.on('end', () => {
+          // Cleanup temp files after streaming
+          try {
+            fs.unlinkSync(videoPath);
+            fs.unlinkSync(audioPath);
+            fs.unlinkSync(srtPath);
+            fs.unlinkSync(outputPath); // Clean up output file too
+          } catch (err) {
+            console.warn("⚠️ Cleanup error:", err.message);
+          }
+        });
+        
+        fileStream.on('error', (err) => {
+          console.error("❌ File stream error:", err.message);
+          if (!res.headersSent) {
+            res.status(500).json({ error: "Failed to stream video" });
+          }
+        });
       })
       .on("error", (err) => {
         console.error("❌ FFmpeg error:", err.message);
         if (!res.headersSent) {
           return res.status(500).json({ error: "Failed to create video" });
         }
-      });
-
-    // Stream directly to response
-    ffmpegProcess.pipe(res, { end: true });
+      })
+      .save(outputPath);
 
   } catch (err) {
     console.error("❌ Server Error:", err);
