@@ -4,10 +4,13 @@ const fs = require("fs");
 const path = require("path");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
+const ffprobePath = require("ffprobe-static").path;
 const googleTTS = require("google-tts-api");
 const { v4: uuidv4 } = require("uuid");
 
+// Set paths for ffmpeg and ffprobe
 ffmpeg.setFfmpegPath(ffmpegPath);
+ffmpeg.setFfprobePath(ffprobePath);
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -22,9 +25,6 @@ app.use(cors({
   allowedHeaders: ["Content-Type"],
 }));
 
-
-
-// Middleware
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -33,7 +33,33 @@ app.use(express.json());
   if (!fs.existsSync(dir)) fs.mkdirSync(dir);
 });
 
-// Multer setup
+// Periodic cleanup: Delete files older than 10 minutes every 5 minutes
+setInterval(() => {
+  const folders = ["uploads", "subtitles", "assets", "output"];
+  const now = Date.now();
+  const maxAge = 10 * 60 * 1000; // 10 minutes
+
+  folders.forEach((folder) => {
+    fs.readdir(folder, (err, files) => {
+      if (err) return;
+      files.forEach((file) => {
+        const filePath = path.join(folder, file);
+        fs.stat(filePath, (err, stats) => {
+          if (err) return;
+          if (now - stats.mtimeMs > maxAge) {
+            fs.unlink(filePath, (err) => {
+              if (!err) {
+                console.log(`🧹 Deleted stale file: ${filePath}`);
+              }
+            });
+          }
+        });
+      });
+    });
+  });
+}, 5 * 60 * 1000); // Runs every 5 minutes
+
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, "uploads/"),
   filename: (req, file, cb) =>
@@ -41,14 +67,22 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Format time for SRT
+// Format time for .srt
 const formatTime = (sec) => {
   const date = new Date(sec * 1000).toISOString().substr(11, 8);
   const ms = String(Math.floor((sec % 1) * 1000)).padStart(3, "0");
   return `${date},${ms}`;
 };
 
-// Upload endpoint - returns video directly
+// Get audio duration using ffprobe
+const getAudioDuration = (filePath) =>
+  new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err) return reject(err);
+      resolve(metadata.format.duration);
+    });
+  });
+
 app.post("/upload", upload.single("video"), async (req, res) => {
   try {
     const videoPath = req.file?.path;
@@ -64,7 +98,7 @@ app.post("/upload", upload.single("video"), async (req, res) => {
       .replace(/\s+/g, " ")
       .trim();
 
-    // TTS audio generation
+    // Generate TTS audio
     const audioBase64 = await googleTTS.getAudioBase64(cleanText, {
       lang: "en",
       slow: false,
@@ -73,32 +107,44 @@ app.post("/upload", upload.single("video"), async (req, res) => {
     const audioPath = `assets/tts_${uuidv4().slice(0, 8)}.aac`;
     fs.writeFileSync(audioPath, Buffer.from(audioBase64, "base64"));
 
-    // Subtitle generation
+    // Generate subtitles line-by-line
     const srtPath = `subtitles/sub_${uuidv4().slice(0, 8)}.srt`;
     const words = cleanText.split(" ");
-    const wordDuration = 0.5;
+    const chunkSize = 6; // words per subtitle line
+    const lines = [];
+    for (let i = 0; i < words.length; i += chunkSize) {
+      lines.push(words.slice(i, i + chunkSize).join(" "));
+    }
+
+    const audioDuration = await getAudioDuration(audioPath);
+    const buffer = 0.15;
+    const lineDuration = Math.max((audioDuration / lines.length) - buffer, 0.5);
+
     let startTime = 0;
-    const srtContent = words
-      .map((word, i) => {
-        const endTime = startTime + wordDuration;
-        const srtBlock = `${i + 1}\n${formatTime(startTime)} --> ${formatTime(endTime)}\n${word}\n`;
-        startTime = endTime;
-        return srtBlock;
-      })
-      .join("\n");
+    const srtContent = lines.map((line, i) => {
+      const endTime = startTime + lineDuration;
+      const srtBlock = `${i + 1}\n${formatTime(startTime)} --> ${formatTime(endTime)}\n${line}\n`;
+      startTime = endTime + buffer;
+      return srtBlock;
+    }).join("\n");
+
     fs.writeFileSync(srtPath, srtContent);
 
-    // Output file path
     const outputFilename = `final_${uuidv4().slice(0, 8)}.mp4`;
     const outputPath = path.join("output", outputFilename);
 
     ffmpeg()
       .input(videoPath)
       .input(audioPath)
-      .videoFilters(`subtitles=${srtPath.replace(/\\/g, "/")}`)
+      .complexFilter([
+        "[0:a]volume=0.3[a0]",       // Lower original video audio
+        "[1:a]volume=1.0[a1]",       // Full TTS volume
+        "[a0][a1]amix=inputs=2:duration=longest[a]", // Mix them
+        `subtitles=${srtPath.replace(/\\/g, "/")}`   // Add subtitles
+      ])
       .outputOptions([
         "-map 0:v:0",
-        "-map 1:a:0",
+        "-map [a]",
         "-c:v libx264",
         "-c:a aac",
         "-shortest"
@@ -125,7 +171,6 @@ app.post("/upload", upload.single("video"), async (req, res) => {
         fileStream.on("close", () => {
           console.log("📤 File stream completed");
 
-          // Cleanup
           try {
             fs.unlinkSync(videoPath);
             fs.unlinkSync(audioPath);
@@ -159,7 +204,6 @@ app.post("/upload", upload.single("video"), async (req, res) => {
   }
 });
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
