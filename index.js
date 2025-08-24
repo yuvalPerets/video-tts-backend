@@ -5,13 +5,11 @@ const path = require("path");
 const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const ffprobePath = require("ffprobe-static").path;
-const googleTTS = require("google-tts-api");
-const fetch = require("node-fetch");
 const { v4: uuidv4 } = require("uuid");
 const cors = require("cors");
-const { pipeline } = require("stream");
 
-
+// Proper Node <18 fetch
+const fetch = require("node-fetch"); // <- must install node-fetch@2
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
@@ -20,156 +18,155 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(cors({
-  origin: ["http://localhost:3000", "https://video-tts-client.vercel.app"],
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type"],
+  origin: ["http://localhost:3000","https://video-tts-client.vercel.app"],
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type"]
 }));
 
-app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Ensure folders exist
-["uploads", "subtitles", "assets", "output"].forEach((dir) => {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
-});
+["uploads","assets","subtitles","output"].forEach(dir => { if(!fs.existsSync(dir)) fs.mkdirSync(dir); });
 
-// Cleanup old files
-setInterval(() => {
-  const folders = ["uploads", "subtitles", "assets", "output"];
-  const now = Date.now();
-  const maxAge = 10 * 60 * 1000; // 10 min
-  folders.forEach((folder) => {
-    fs.readdir(folder, (err, files) => {
-      if (err) return;
-      files.forEach((file) => {
-        const filePath = path.join(folder, file);
-        fs.stat(filePath, (err, stats) => {
-          if (err) return;
-          if (now - stats.mtimeMs > maxAge) fs.unlink(filePath, () => {});
-        });
-      });
-    });
-  });
-}, 5 * 60 * 1000);
-
-// Multer storage
+// Multer setup
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, "uploads/"),
-  filename: (req, file, cb) => cb(null, uuidv4().replace(/-/g, "") + path.extname(file.originalname)),
+  destination: (req,file,cb) => cb(null,"uploads/"),
+  filename: (req,file,cb) => cb(null, uuidv4().replace(/-/g,"") + path.extname(file.originalname))
 });
 const upload = multer({ storage });
 
-// Format time for SRT
+// Memory logging
+const logMemory = (step) => {
+  const mem = process.memoryUsage();
+  console.log(`[Memory] ${step}: RSS=${(mem.rss/1024/1024).toFixed(2)}MB HeapUsed=${(mem.heapUsed/1024/1024).toFixed(2)}MB`);
+};
+
+// Format SRT time
 const formatTime = (sec) => {
-  const date = new Date(sec * 1000).toISOString().substr(11, 8);
-  const ms = String(Math.floor((sec % 1) * 1000)).padStart(3, "0");
+  const date = new Date(sec*1000).toISOString().substr(11,8);
+  const ms = String(Math.floor((sec%1)*1000)).padStart(3,"0");
   return `${date},${ms}`;
 };
 
 // Get audio duration
-const getAudioDuration = (filePath) =>
-  new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (err, metadata) => {
-      if (err) return reject(err);
-      resolve(metadata.format.duration);
-    });
-  });
+const getAudioDuration = (filePath) => new Promise((resolve,reject) => {
+  ffmpeg.ffprobe(filePath,(err,meta)=>{ if(err) reject(err); else resolve(meta.format.duration); });
+});
+
+// Generate SRT from text and audio duration
+const generateSrt = (text, duration, chunkSize=6) => {
+  const words = text.replace(/[^\w\s.,!?'"()-]/g,"").split(" ");
+  const lines = [];
+  for(let i=0;i<words.length;i+=chunkSize) lines.push(words.slice(i,i+chunkSize).join(" "));
+  const buffer = 0.15;
+  const lineDuration = Math.max((duration/lines.length)-buffer,0.5);
+  let startTime = 0;
+  const srtContent = lines.map((line,i)=>{
+    const endTime = startTime + lineDuration;
+    const block = `${i+1}\n${formatTime(startTime)} --> ${formatTime(endTime)}\n${line}\n`;
+    startTime = endTime + buffer;
+    return block;
+  }).join("\n");
+  return srtContent;
+};
 
 // Upload endpoint
-app.post("/upload", upload.single("video"), async (req, res) => {
-  try {
-    let videoPath = req.file?.path;
-    const inputText = req.body?.text;
-    if (!inputText || !videoPath) return res.status(400).json({ error: "Missing video or text input" });
+app.post("/upload", upload.single("video"), async (req,res)=>{
+  try{
+    const videoFile = req.file;
+    const text = req.body?.text;
+    if(!videoFile || !text) return res.status(400).json({error:"Missing video or text"});
 
-    // Convert any video to MP4 and downscale to 720p if too large
-    const convertedVideoPath = `uploads/converted_${uuidv4().slice(0, 8)}.mp4`;
-    await new Promise((resolve, reject) => {
-      ffmpeg(videoPath)
-        .outputOptions(["-c:v libx264", "-c:a aac", "-movflags +faststart", "-vf scale='min(1280,iw)':-2"])
+    logMemory("After upload");
+
+    // Stage 1: Convert/downscale video to 480p MP4
+    const convertedPath = `uploads/converted_${uuidv4().slice(0,8)}.mp4`;
+    await new Promise((resolve,reject)=>{
+      ffmpeg(videoFile.path)
+        .outputOptions([
+          "-c:v libx264",
+          "-c:a aac",
+          "-movflags +faststart",
+          "-vf scale=854:-2",
+          "-crf 28",
+          "-preset veryfast"
+        ])
         .on("end", resolve)
         .on("error", reject)
-        .save(convertedVideoPath);
+        .save(convertedPath);
     });
-    if (convertedVideoPath !== videoPath) fs.unlinkSync(videoPath);
-    videoPath = convertedVideoPath;
+    fs.unlinkSync(videoFile.path);
+    logMemory("After convert/downscale");
 
-    // Write TTS audio directly to file via streaming
-    const audioPath = `assets/tts_${uuidv4().slice(0, 8)}.mp3`;
-    const ttsUrl = googleTTS.getAudioUrl(inputText, { lang: "en", slow: false });
+    // Stage 2: Generate TTS audio -> stream to file
+    const audioPath = `assets/tts_${uuidv4().slice(0,8)}.mp3`;
+    const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=${encodeURIComponent(text)}`;
     const response = await fetch(ttsUrl);
-    await new Promise((resolve, reject) => {
+    await new Promise((resolve,reject)=>{
       const fileStream = fs.createWriteStream(audioPath);
-      pipeline(response.body, fileStream, (err) => (err ? reject(err) : resolve()));
+      response.body.pipe(fileStream);
+      response.body.on("error", reject);
+      fileStream.on("finish", resolve);
     });
+    logMemory("After TTS");
 
-    // Generate subtitles
-    const srtPath = `subtitles/sub_${uuidv4().slice(0, 8)}.srt`;
-    const words = inputText.split(" ");
-    const chunkSize = 6;
-    const lines = [];
-    for (let i = 0; i < words.length; i += chunkSize) lines.push(words.slice(i, i + chunkSize).join(" "));
+    // Stage 3: Get audio duration and generate subtitles
     const audioDuration = await getAudioDuration(audioPath);
-    const buffer = 0.15;
-    const lineDuration = Math.max(audioDuration / lines.length - buffer, 0.5);
-    let startTime = 0;
-    const srtContent = lines.map((line, i) => {
-      const endTime = startTime + lineDuration;
-      const block = `${i + 1}\n${formatTime(startTime)} --> ${formatTime(endTime)}\n${line}\n`;
-      startTime = endTime + buffer;
-      return block;
-    }).join("\n");
+    const srtPath = `subtitles/sub_${uuidv4().slice(0,8)}.srt`;
+    const srtContent = generateSrt(text, audioDuration);
     fs.writeFileSync(srtPath, srtContent);
+    logMemory("After SRT generation");
 
-    // Output file
-    const outputFilename = `final_${uuidv4().slice(0, 8)}.mp4`;
-    const outputPath = path.join("output", outputFilename);
+    // Stage 4: Mix audio and burn subtitles
+    const outputFilename = `final_${uuidv4().slice(0,8)}.mp4`;
+    const outputPath = path.join("output",outputFilename);
 
-    // FFmpeg final processing (streaming)
-    ffmpeg()
-      .input(videoPath)
-      .input(audioPath)
-      .complexFilter([
-        "[0:a]volume=0.3[a0]; [1:a]volume=1.0[a1]; [a0][a1]amix=inputs=2:duration=longest[a]",
-        `subtitles='${srtPath.replace(/\\/g, "/")}'`
-      ])
-      .outputOptions(["-map 0:v:0", "-map [a]", "-c:v libx264", "-c:a aac", "-shortest"])
-      .on("start", (cmd) => console.log("🎬 FFmpeg started:", cmd))
-      .on("end", () => {
-        console.log("✅ FFmpeg finished. Streaming file...");
-        const fileStat = fs.statSync(outputPath);
-        res.writeHead(200, {
-          "Content-Type": "video/mp4",
-          "Content-Disposition": `attachment; filename="${outputFilename}"`,
-          "Content-Length": fileStat.size,
-        });
-        const fileStream = fs.createReadStream(outputPath);
-        fileStream.pipe(res);
+    await new Promise((resolve,reject)=>{
+      ffmpeg()
+        .input(convertedPath)
+        .input(audioPath)
+        .complexFilter([
+          "[0:a]volume=0.3[a0]",
+          "[1:a]volume=1.0[a1]",
+          "[a0][a1]amix=inputs=2:duration=longest[a]",
+          `subtitles=${srtPath.replace(/\\/g,"/")}`
+        ])
+        .outputOptions([
+          "-map 0:v:0",
+          "-map [a]",
+          "-c:v libx264",
+          "-c:a aac",
+          "-shortest"
+        ])
+        .on("end", resolve)
+        .on("error", reject)
+        .save(outputPath);
+    });
+    logMemory("After audio mix + subtitles");
 
-        fileStream.on("close", () => {
-          console.log("📤 File stream completed. Cleaning up...");
-          [videoPath, audioPath, srtPath, outputPath].forEach(f => { if (fs.existsSync(f)) fs.unlinkSync(f); });
-        });
+    // Cleanup
+    fs.unlinkSync(convertedPath);
+    fs.unlinkSync(audioPath);
+    fs.unlinkSync(srtPath);
 
-        fileStream.on("error", (err) => {
-          console.error("❌ File stream error:", err.message);
-          if (!res.headersSent) res.status(500).json({ error: "Failed to stream video" });
-        });
-      })
-      .on("error", (err) => {
-        console.error("❌ FFmpeg error:", err.message);
-        if (!res.headersSent) res.status(500).json({ error: "Failed to create video" });
-      })
-      .save(outputPath);
+    // Stream final file
+    const fileStat = fs.statSync(outputPath);
+    res.writeHead(200,{
+      "Content-Type":"video/mp4",
+      "Content-Disposition": `attachment; filename="${outputFilename}"`,
+      "Content-Length": fileStat.size
+    });
+    const fileStream = fs.createReadStream(outputPath);
+    fileStream.pipe(res);
+    fileStream.on("close", ()=> fs.unlinkSync(outputPath));
 
-  } catch (err) {
-    console.error("❌ Server Error:", err);
-    if (!res.headersSent) res.status(500).json({ error: "Server failed" });
+  } catch(err){
+    console.error("Server error:",err);
+    if(!res.headersSent) res.status(500).json({error:"Processing failed"});
   }
 });
 
-app.get("/health", (req, res) => {
-  res.json({ status: "OK", timestamp: new Date().toISOString() });
-});
+app.get("/health",(req,res)=>res.json({status:"OK",timestamp:new Date().toISOString()}));
 
-app.listen(port, () => console.log(`🚀 Server running at http://localhost:${port}`));
+app.listen(port,()=>console.log(`🚀 Server running at http://localhost:${port}`));
