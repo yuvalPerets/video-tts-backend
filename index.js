@@ -47,9 +47,9 @@ const formatTime = (sec) => {
   return `${date},${ms}`;
 };
 
-// Get audio duration
-const getAudioDuration = (filePath) => new Promise((resolve,reject) => {
-  ffmpeg.ffprobe(filePath,(err,meta)=>{ if(err) reject(err); else resolve(meta.format.duration); });
+// Get video/audio metadata
+const getMetadata = (filePath) => new Promise((resolve,reject) => {
+  ffmpeg.ffprobe(filePath,(err,meta)=>{ if(err) reject(err); else resolve(meta); });
 });
 
 // Generate SRT from text and audio duration
@@ -69,7 +69,7 @@ const generateSrt = (text, duration, chunkSize=6) => {
   return srtContent;
 };
 
-// Download TTS audio using https module
+// Download TTS audio using https
 const downloadTTS = (text, filePath) => {
   return new Promise((resolve,reject)=>{
     const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=${encodeURIComponent(text)}`;
@@ -90,26 +90,36 @@ app.post("/upload", upload.single("video"), async (req,res)=>{
     const text = req.body?.text;
     if(!videoFile || !text) return res.status(400).json({error:"Missing video or text"});
 
+    console.log(`🎬 New video received: ${videoFile.originalname}`);
     logMemory("After upload");
 
-    // Stage 1: Convert/downscale video to 480p MP4
-    const convertedPath = `uploads/converted_${uuidv4().slice(0,8)}.mp4`;
-    await new Promise((resolve,reject)=>{
-      ffmpeg(videoFile.path)
-        .outputOptions([
-          "-c:v libx264",
-          "-c:a aac",
-          "-movflags +faststart",
-          "-vf scale=854:-2",
-          "-crf 28",
-          "-preset veryfast"
-        ])
-        .on("end", resolve)
-        .on("error", reject)
-        .save(convertedPath);
-    });
-    fs.unlinkSync(videoFile.path);
-    logMemory("After convert/downscale");
+    const metadata = await getMetadata(videoFile.path);
+    const videoStream = metadata.streams.find(s => s.codec_type === "video");
+    let processedPath = videoFile.path;
+
+    // If not MP4 or width > 720, re-encode/downscale; otherwise, skip
+    if(videoFile.mimetype !== "video/mp4" || videoStream.width > 720){
+      const convertedPath = `uploads/converted_${uuidv4().slice(0,8)}.mp4`;
+      await new Promise((resolve,reject)=>{
+        ffmpeg(videoFile.path)
+          .outputOptions([
+            "-c:v libx264",
+            "-c:a aac",
+            "-movflags +faststart",
+            "-vf scale=854:-2",
+            "-crf 28",
+            "-preset veryfast"
+          ])
+          .on("end", resolve)
+          .on("error", reject)
+          .save(convertedPath);
+      });
+      fs.unlinkSync(videoFile.path);
+      processedPath = convertedPath;
+      logMemory("After convert/downscale");
+    } else {
+      console.log("✅ Video compatible — skipping conversion");
+    }
 
     // Stage 2: Generate TTS audio -> stream to file
     const audioPath = `assets/tts_${uuidv4().slice(0,8)}.mp3`;
@@ -117,7 +127,7 @@ app.post("/upload", upload.single("video"), async (req,res)=>{
     logMemory("After TTS");
 
     // Stage 3: Get audio duration and generate subtitles
-    const audioDuration = await getAudioDuration(audioPath);
+    const audioDuration = await getMetadata(audioPath).then(m => m.format.duration);
     const srtPath = `subtitles/sub_${uuidv4().slice(0,8)}.srt`;
     const srtContent = generateSrt(text, audioDuration);
     fs.writeFileSync(srtPath, srtContent);
@@ -129,7 +139,7 @@ app.post("/upload", upload.single("video"), async (req,res)=>{
 
     await new Promise((resolve,reject)=>{
       ffmpeg()
-        .input(convertedPath)
+        .input(processedPath)
         .input(audioPath)
         .complexFilter([
           "[0:a]volume=0.3[a0]",
@@ -151,12 +161,13 @@ app.post("/upload", upload.single("video"), async (req,res)=>{
     logMemory("After audio mix + subtitles");
 
     // Cleanup
-    fs.unlinkSync(convertedPath);
+    if(processedPath !== videoFile.path) fs.unlinkSync(processedPath);
     fs.unlinkSync(audioPath);
     fs.unlinkSync(srtPath);
 
     // Stream final file
     const fileStat = fs.statSync(outputPath);
+    console.log(`📤 Sending video: ${outputFilename}`);
     res.writeHead(200,{
       "Content-Type":"video/mp4",
       "Content-Disposition": `attachment; filename="${outputFilename}"`,
@@ -167,7 +178,7 @@ app.post("/upload", upload.single("video"), async (req,res)=>{
     fileStream.on("close", ()=> fs.unlinkSync(outputPath));
 
   } catch(err){
-    console.error("Server error:",err);
+    console.error("❌ Server error:",err);
     if(!res.headersSent) res.status(500).json({error:"Processing failed"});
   }
 });
