@@ -101,20 +101,23 @@ app.post("/upload", upload.single("video"), async (req,res)=>{
     if(videoFile.mimetype !== "video/mp4" || videoStream.width > 720){
       const convertedPath = `uploads/converted_${uuidv4().slice(0,8)}.mp4`;
       await new Promise((resolve,reject)=>{
-        ffmpeg(videoFile.path)
+        const ffmpegProc = ffmpeg(videoFile.path)
           .outputOptions([
             "-c:v libx264",
             "-c:a aac",
             "-movflags +faststart",
-            "-vf scale=854:-2",
+            "-vf scale=640:-2", // Lower resolution for speed
             "-crf 28",
-            "-preset veryfast"
+            "-preset ultrafast" // Faster preset
           ])
+          .on("start", cmdLine => {
+            try { process.setPriority && process.setPriority(process.pid, 1); } catch(e){}
+          })
           .on("end", resolve)
           .on("error", reject)
           .save(convertedPath);
       });
-      fs.unlinkSync(videoFile.path);
+      fs.unlink(videoFile.path, () => {});
       processedPath = convertedPath;
       logMemory("After convert/downscale");
     } else {
@@ -160,10 +163,10 @@ app.post("/upload", upload.single("video"), async (req,res)=>{
     });
     logMemory("After audio mix + subtitles");
 
-    // Cleanup
-    if(processedPath !== videoFile.path) fs.unlinkSync(processedPath);
-    fs.unlinkSync(audioPath);
-    fs.unlinkSync(srtPath);
+    // Cleanup (after response)
+    const cleanupFiles = [outputPath];
+    if(processedPath !== videoFile.path) cleanupFiles.push(processedPath);
+    cleanupFiles.push(audioPath, srtPath);
 
     // Stream final file
     const fileStat = fs.statSync(outputPath);
@@ -175,7 +178,9 @@ app.post("/upload", upload.single("video"), async (req,res)=>{
     });
     const fileStream = fs.createReadStream(outputPath);
     fileStream.pipe(res);
-    fileStream.on("close", ()=> fs.unlinkSync(outputPath));
+    fileStream.on("close", ()=>{
+      cleanupFiles.forEach(f => fs.unlink(f, ()=>{}));
+    });
 
   } catch(err){
     console.error("❌ Server error:",err);
