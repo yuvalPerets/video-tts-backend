@@ -7,9 +7,7 @@ const ffmpegPath = require("ffmpeg-static");
 const ffprobePath = require("ffprobe-static").path;
 const { v4: uuidv4 } = require("uuid");
 const cors = require("cors");
-
-// Proper Node <18 fetch
-const fetch = require("node-fetch"); // <- must install node-fetch@2
+const https = require("https");
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
@@ -71,6 +69,20 @@ const generateSrt = (text, duration, chunkSize=6) => {
   return srtContent;
 };
 
+// Download TTS audio using https module
+const downloadTTS = (text, filePath) => {
+  return new Promise((resolve,reject)=>{
+    const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=${encodeURIComponent(text)}`;
+    const file = fs.createWriteStream(filePath);
+    https.get(ttsUrl,(res)=>{
+      if(res.statusCode!==200) return reject(new Error(`TTS request failed: ${res.statusCode}`));
+      res.pipe(file);
+      file.on("finish",()=>{ file.close(resolve); });
+      file.on("error",(err)=>{ fs.unlinkSync(filePath); reject(err); });
+    }).on("error",(err)=>{ reject(err); });
+  });
+};
+
 // Upload endpoint
 app.post("/upload", upload.single("video"), async (req,res)=>{
   try{
@@ -101,14 +113,7 @@ app.post("/upload", upload.single("video"), async (req,res)=>{
 
     // Stage 2: Generate TTS audio -> stream to file
     const audioPath = `assets/tts_${uuidv4().slice(0,8)}.mp3`;
-    const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=en&client=tw-ob&q=${encodeURIComponent(text)}`;
-    const response = await fetch(ttsUrl);
-    await new Promise((resolve,reject)=>{
-      const fileStream = fs.createWriteStream(audioPath);
-      response.body.pipe(fileStream);
-      response.body.on("error", reject);
-      fileStream.on("finish", resolve);
-    });
+    await downloadTTS(text, audioPath);
     logMemory("After TTS");
 
     // Stage 3: Get audio duration and generate subtitles
