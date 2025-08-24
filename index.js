@@ -185,4 +185,5 @@ app.post("/upload", upload.single("video"), async (req,res)=>{
 
 app.get("/health",(req,res)=>res.json({status:"OK",timestamp:new Date().toISOString()}));
 
-app.listen(port,()=>console.log(`🚀 Server running at http://localhost:${port}`));
+const server = app.listen(port,()=>console.log(`🚀 Server running at http://localhost:${port}`));
+server.timeout = 10 * 60 * 1000; // 10 minutes
