@@ -6,22 +6,19 @@ const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const ffprobePath = require("ffprobe-static").path;
 const googleTTS = require("google-tts-api");
+const fetch = require("node-fetch");
 const { v4: uuidv4 } = require("uuid");
 const cors = require("cors");
+const { pipeline } = require("stream");
 
-// Set paths for ffmpeg and ffprobe
 ffmpeg.setFfmpegPath(ffmpegPath);
 ffmpeg.setFfprobePath(ffprobePath);
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// CORS
 app.use(cors({
-  origin: [
-    "http://localhost:3000",
-    "https://video-tts-client.vercel.app"
-  ],
+  origin: ["http://localhost:3000", "https://video-tts-client.vercel.app"],
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type"],
 }));
@@ -29,17 +26,16 @@ app.use(cors({
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Ensure required folders exist
+// Ensure folders exist
 ["uploads", "subtitles", "assets", "output"].forEach((dir) => {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir);
 });
 
-// Periodic cleanup: Delete files older than 10 minutes every 5 minutes
+// Cleanup old files
 setInterval(() => {
   const folders = ["uploads", "subtitles", "assets", "output"];
   const now = Date.now();
-  const maxAge = 10 * 60 * 1000; // 10 minutes
-
+  const maxAge = 10 * 60 * 1000; // 10 min
   folders.forEach((folder) => {
     fs.readdir(folder, (err, files) => {
       if (err) return;
@@ -47,33 +43,28 @@ setInterval(() => {
         const filePath = path.join(folder, file);
         fs.stat(filePath, (err, stats) => {
           if (err) return;
-          if (now - stats.mtimeMs > maxAge) {
-            fs.unlink(filePath, (err) => {
-              if (!err) console.log(`🧹 Deleted stale file: ${filePath}`);
-            });
-          }
+          if (now - stats.mtimeMs > maxAge) fs.unlink(filePath, () => {});
         });
       });
     });
   });
-}, 5 * 60 * 1000); // Runs every 5 minutes
+}, 5 * 60 * 1000);
 
 // Multer storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, "uploads/"),
-  filename: (req, file, cb) =>
-    cb(null, uuidv4().replace(/-/g, "") + path.extname(file.originalname)),
+  filename: (req, file, cb) => cb(null, uuidv4().replace(/-/g, "") + path.extname(file.originalname)),
 });
 const upload = multer({ storage });
 
-// Format time for .srt
+// Format time for SRT
 const formatTime = (sec) => {
   const date = new Date(sec * 1000).toISOString().substr(11, 8);
   const ms = String(Math.floor((sec % 1) * 1000)).padStart(3, "0");
   return `${date},${ms}`;
 };
 
-// Get audio duration using ffprobe
+// Get audio duration
 const getAudioDuration = (filePath) =>
   new Promise((resolve, reject) => {
     ffmpeg.ffprobe(filePath, (err, metadata) => {
@@ -87,72 +78,52 @@ app.post("/upload", upload.single("video"), async (req, res) => {
   try {
     let videoPath = req.file?.path;
     const inputText = req.body?.text;
+    if (!inputText || !videoPath) return res.status(400).json({ error: "Missing video or text input" });
 
-    if (!inputText || !videoPath) {
-      return res.status(400).json({ error: "Missing video or text input" });
-    }
-
-    // Convert unsupported formats to mp4
-    const ext = path.extname(videoPath).toLowerCase();
-    const supportedExts = [".mp4", ".mov", ".avi"];
-    if (!supportedExts.includes(ext)) {
-      const convertedPath = `uploads/converted_${uuidv4().slice(0, 8)}.mp4`;
-      await new Promise((resolve, reject) => {
-        ffmpeg(videoPath)
-          .outputOptions(["-c:v libx264", "-c:a aac", "-movflags +faststart"])
-          .on("end", resolve)
-          .on("error", reject)
-          .save(convertedPath);
-      });
-      fs.unlinkSync(videoPath);
-      console.log(`♻️ Converted ${videoPath} to ${convertedPath}`);
-      videoPath = convertedPath;
-    }
-
-    // Clean text
-    const cleanText = inputText
-      .normalize("NFKC")
-      .replace(/[^\w\s.,!?'"()-]/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    // Generate TTS audio (.mp3)
-    const audioBase64 = await googleTTS.getAudioBase64(cleanText, {
-      lang: "en",
-      slow: false,
-      host: "https://translate.google.com",
+    // Convert any video to MP4 and downscale to 720p if too large
+    const convertedVideoPath = `uploads/converted_${uuidv4().slice(0, 8)}.mp4`;
+    await new Promise((resolve, reject) => {
+      ffmpeg(videoPath)
+        .outputOptions(["-c:v libx264", "-c:a aac", "-movflags +faststart", "-vf scale='min(1280,iw)':-2"])
+        .on("end", resolve)
+        .on("error", reject)
+        .save(convertedVideoPath);
     });
+    if (convertedVideoPath !== videoPath) fs.unlinkSync(videoPath);
+    videoPath = convertedVideoPath;
+
+    // Write TTS audio directly to file via streaming
     const audioPath = `assets/tts_${uuidv4().slice(0, 8)}.mp3`;
-    fs.writeFileSync(audioPath, Buffer.from(audioBase64, "base64"));
+    const ttsUrl = googleTTS.getAudioUrl(inputText, { lang: "en", slow: false });
+    const response = await fetch(ttsUrl);
+    await new Promise((resolve, reject) => {
+      const fileStream = fs.createWriteStream(audioPath);
+      pipeline(response.body, fileStream, (err) => (err ? reject(err) : resolve()));
+    });
 
-    // Generate subtitles line-by-line
+    // Generate subtitles
     const srtPath = `subtitles/sub_${uuidv4().slice(0, 8)}.srt`;
-    const words = cleanText.split(" ");
-    const chunkSize = 6; // words per subtitle line
+    const words = inputText.split(" ");
+    const chunkSize = 6;
     const lines = [];
-    for (let i = 0; i < words.length; i += chunkSize) {
-      lines.push(words.slice(i, i + chunkSize).join(" "));
-    }
-
+    for (let i = 0; i < words.length; i += chunkSize) lines.push(words.slice(i, i + chunkSize).join(" "));
     const audioDuration = await getAudioDuration(audioPath);
     const buffer = 0.15;
     const lineDuration = Math.max(audioDuration / lines.length - buffer, 0.5);
-
     let startTime = 0;
     const srtContent = lines.map((line, i) => {
       const endTime = startTime + lineDuration;
-      const srtBlock = `${i + 1}\n${formatTime(startTime)} --> ${formatTime(endTime)}\n${line}\n`;
+      const block = `${i + 1}\n${formatTime(startTime)} --> ${formatTime(endTime)}\n${line}\n`;
       startTime = endTime + buffer;
-      return srtBlock;
+      return block;
     }).join("\n");
-
     fs.writeFileSync(srtPath, srtContent);
 
-    // Output video path
+    // Output file
     const outputFilename = `final_${uuidv4().slice(0, 8)}.mp4`;
     const outputPath = path.join("output", outputFilename);
 
-    // FFmpeg processing
+    // FFmpeg final processing (streaming)
     ffmpeg()
       .input(videoPath)
       .input(audioPath)
@@ -164,7 +135,6 @@ app.post("/upload", upload.single("video"), async (req, res) => {
       .on("start", (cmd) => console.log("🎬 FFmpeg started:", cmd))
       .on("end", () => {
         console.log("✅ FFmpeg finished. Streaming file...");
-
         const fileStat = fs.statSync(outputPath);
         res.writeHead(200, {
           "Content-Type": "video/mp4",
@@ -176,9 +146,7 @@ app.post("/upload", upload.single("video"), async (req, res) => {
 
         fileStream.on("close", () => {
           console.log("📤 File stream completed. Cleaning up...");
-          [videoPath, audioPath, srtPath, outputPath].forEach((f) => {
-            if (fs.existsSync(f)) fs.unlinkSync(f);
-          });
+          [videoPath, audioPath, srtPath, outputPath].forEach(f => { if (fs.existsSync(f)) fs.unlinkSync(f); });
         });
 
         fileStream.on("error", (err) => {
@@ -198,12 +166,8 @@ app.post("/upload", upload.single("video"), async (req, res) => {
   }
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+app.get("/health", (req, res) => {
+  res.json({ status: "OK", timestamp: new Date().toISOString() });
 });
 
-// Start server
-app.listen(port, () => {
-  console.log(`🚀 Server running at http://localhost:${port}`);
-});
+app.listen(port, () => console.log(`🚀 Server running at http://localhost:${port}`));
